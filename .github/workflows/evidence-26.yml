@@ -1,0 +1,88 @@
+# Fork-only evidence run for postfiatl1v2#26 (not part of the PR). It runs on
+# the PR head (this commit's parent): the regression check green on the PR
+# head and red on the RC10 scripts, the original #26 failures reproduced with
+# the RC10 start commands on a fresh devnet node, then a fresh devnet started
+# with the current scripts, and the node's focused storage-acknowledgement test.
+name: evidence-26 devnet storage flag
+on: [push, workflow_dispatch]
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force
+          sudo apt-get clean
+          df -h /
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Commits under test
+        run: |
+          git log --oneline -3
+          git checkout -q HEAD~1   # the PR head; this commit only adds this workflow
+          echo "PR head: $(git rev-parse HEAD)"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: "GREEN: scripts/test-devnet-start-flags on the PR head"
+        run: python3 scripts/test-devnet-start-flags
+      - name: "RED: the same check on the RC10 start scripts (11839c14f2), as reported in #26"
+        run: |
+          set +e
+          rc10=$(mktemp -d)
+          mkdir -p "$rc10/scripts" "$rc10/crates/node/src/main_parts/cli_dispatch_parts"
+          for f in scripts/node-run scripts/devnet-up scripts/devnet-restart scripts/testnet-local-harness; do
+            git show "11839c14f2:$f" >"$rc10/$f"
+          done
+          cp crates/node/src/main_parts/cli_dispatch_parts/group_03.rs "$rc10/crates/node/src/main_parts/cli_dispatch_parts/"
+          cp scripts/test-devnet-start-flags "$rc10/scripts/"
+          python3 "$rc10/scripts/test-devnet-start-flags"
+          rc=$?
+          echo "exit code: $rc (expected 1)"
+          test "$rc" -eq 1
+      - name: Build postfiat-node
+        run: cargo build --locked -p postfiat-node --bin postfiat-node
+      - name: "BEFORE: the RC10 start commands on a fresh devnet node fail as in #26"
+        run: |
+          set +e
+          node_dir="$(mktemp -d)/node0"
+          DATA_DIR="$node_dir" scripts/node-init >/dev/null
+          echo '$ DATA_DIR=<fresh node> bash <RC10 scripts/node-run>   # cargo run -p postfiat-node -- run --data-dir "$DATA_DIR"'
+          git show 11839c14f2:scripts/node-run >/tmp/node-run-rc10
+          DATA_DIR="$node_dir" bash /tmp/node-run-rc10 2>&1 | tail -4
+          echo "exit code: ${PIPESTATUS[0]}"
+          echo
+          echo '$ target/debug/postfiat-node run --data-dir <fresh node>   # RC10 scripts/testnet-local-harness:163'
+          target/debug/postfiat-node run --data-dir "$node_dir" 2>&1 | head -2
+          echo "exit code: ${PIPESTATUS[0]}"
+      - name: "AFTER: scripts/node-init + scripts/node-run on a fresh devnet node"
+        run: |
+          node_dir="$(mktemp -d)/node0"
+          DATA_DIR="$node_dir" scripts/node-init >/dev/null
+          echo '$ DATA_DIR=<fresh node> scripts/node-run'
+          DATA_DIR="$node_dir" bash -x scripts/node-run 2>/tmp/trace >/tmp/run.json
+          echo "exit code: $?"
+          grep -E '^\+ cargo run' /tmp/trace
+          head -c 600 /tmp/run.json; echo
+      - name: "AFTER: scripts/node-helper-smoke (init, run, status, faucet, transfer, account)"
+        run: scripts/node-helper-smoke
+      - name: "AFTER: scripts/devnet-up (fresh 4-validator devnet) and scripts/devnet-restart"
+        run: |
+          base="$(mktemp -d)"
+          BASE_DIR="$base/local" LOG_DIR="$base/logs" scripts/devnet-up | tail -20
+          echo "devnet-up exit code: ${PIPESTATUS[0]}"
+          BASE_DIR="$base/local" LOG_DIR="$base/logs" scripts/devnet-restart | tail -20
+          echo "devnet-restart exit code: ${PIPESTATUS[0]}"
+      - name: "Focused node test: run needs the acknowledgement on a JSON store"
+        run: cargo test --locked -p postfiat-node --bin postfiat-node long_running_validator_service_requires_explicit_json_storage_acknowledgement
+      - name: "Other modes unchanged: the PR touches no node source or start script"
+        run: |
+          git diff --stat 78fc09a HEAD
+          ! git diff --name-only 78fc09a HEAD | grep -vE '^(scripts/test-devnet-start-flags|\.github/workflows/product-security-ci\.yml)$'
